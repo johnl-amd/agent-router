@@ -1350,6 +1350,27 @@ func TestPatchListenerWithInferencePoolFilters(t *testing.T) {
 		require.Equal(t, "envoy.filters.http.router", hcm.HttpFilters[2].Name)
 	})
 
+	t.Run("same inference pool referenced by multiple route rules", func(t *testing.T) {
+		existingFilters := []*httpconnectionmanagerv3.HttpFilter{
+			{Name: "envoy.filters.http.router"},
+		}
+
+		listener := createListenerWithHCM("test-listener", existingFilters)
+		// The caller appends one entry per route rule referencing the pool, so a pool
+		// referenced by three rules of the same route arrives here three times.
+		pool := createInferencePool("test-pool", "test-ns")
+		pools := []*gwaiev1.InferencePool{pool, pool, pool}
+
+		s.patchListenerWithInferencePoolFilters(listener, pools)
+
+		hcm := &httpconnectionmanagerv3.HttpConnectionManager{}
+		err := listener.DefaultFilterChain.Filters[0].GetTypedConfig().UnmarshalTo(hcm)
+		require.NoError(t, err)
+		require.Len(t, hcm.HttpFilters, 2) // One endpoint-picker filter + router.
+		require.Equal(t, httpFilterNameForInferencePool(pool), hcm.HttpFilters[0].Name)
+		require.Equal(t, "envoy.filters.http.router", hcm.HttpFilters[1].Name)
+	})
+
 	t.Run("listener with both filter chains and default filter chain", func(t *testing.T) {
 		hcm := &httpconnectionmanagerv3.HttpConnectionManager{
 			HttpFilters: []*httpconnectionmanagerv3.HttpFilter{

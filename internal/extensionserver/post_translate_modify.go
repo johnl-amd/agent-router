@@ -788,7 +788,16 @@ func (s *Server) patchListenerWithInferencePoolFilters(listener *listenerv3.List
 			continue
 		}
 		var poolFilters []*httpconnectionmanagerv3.HttpFilter
+		// inferencePools carries one entry per route rule referencing the pool, so the same pool
+		// can appear several times. Track what this batch has already added, otherwise each
+		// reference appends its own identical filter and the request is sent to the endpoint
+		// picker once per duplicate.
+		added := make(map[string]struct{}, len(inferencePools))
 		for _, pool := range inferencePools {
+			filterName := httpFilterNameForInferencePool(pool)
+			if _, dup := added[filterName]; dup {
+				continue
+			}
 			_, baIndex, searchErr := searchInferencePoolInFilterChain(pool, httpConManager.HttpFilters)
 			if searchErr != nil {
 				s.log.Error(searchErr, "failed to find an inference pool ext proc filter")
@@ -803,6 +812,7 @@ func (s *Server) patchListenerWithInferencePoolFilters(listener *listenerv3.List
 					continue
 				}
 				poolFilters = append(poolFilters, eppExtProc)
+				added[filterName] = struct{}{}
 			}
 		}
 		if len(poolFilters) != 0 {
