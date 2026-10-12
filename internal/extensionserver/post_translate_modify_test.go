@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	gwaiev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aigv1b1 "github.com/envoyproxy/ai-gateway/api/v1beta1"
@@ -711,4 +712,80 @@ func Test_maybeModifyCluster_rebuildsOwnFiltersOnExistingChain(t *testing.T) {
 		names = append(names, f.GetName())
 	}
 	require.Equal(t, []string{aiGatewayExtProcName, aiGatewayHeaderMutationName, "envoy.filters.http.upstream_codec"}, names)
+}
+
+func Test_maybeModifyListenerAndRoutes_stableInferencePoolFilterOrder(t *testing.T) {
+	// Declared in the reverse of their sorted order, which is not a rotation of it, so a
+	// single unsorted pass cannot match by chance. The namespaces differ as well as the
+	// names, so both halves of the comparator are exercised.
+	pools := []struct{ route, namespace, name string }{
+		{"route-1", "test-ns", "pool-zulu"},
+		{"route-2", "test-ns", "pool-mike"},
+		{"route-3", "other-ns", "pool-alpha"},
+	}
+
+	newFixture := func() ([]*listenerv3.Listener, []*routev3.RouteConfiguration) {
+		hcm := &httpconnectionmanagerv3.HttpConnectionManager{
+			RouteSpecifier: &httpconnectionmanagerv3.HttpConnectionManager_Rds{
+				Rds: &httpconnectionmanagerv3.Rds{RouteConfigName: "route-config"},
+			},
+			HttpFilters: []*httpconnectionmanagerv3.HttpFilter{{Name: "envoy.filters.http.router"}},
+		}
+		listener := &listenerv3.Listener{
+			Name: "test-listener",
+			DefaultFilterChain: &listenerv3.FilterChain{
+				Filters: []*listenerv3.Filter{{
+					Name:       wellknown.HTTPConnectionManager,
+					ConfigType: &listenerv3.Filter_TypedConfig{TypedConfig: mustToAny(t, hcm)},
+				}},
+			},
+		}
+		vh := &routev3.VirtualHost{Name: "test-vh"}
+		for _, p := range pools {
+			vh.Routes = append(vh.Routes, &routev3.Route{
+				Name: p.route,
+				Metadata: &corev3.Metadata{FilterMetadata: map[string]*structpb.Struct{
+					internalapi.InternalEndpointMetadataNamespace: {Fields: map[string]*structpb.Value{
+						"per_route_rule_inference_pool": structpb.NewStringValue(
+							p.namespace + "/" + p.name + "/test-epp/9002/duplex/false"),
+					}},
+				}},
+			})
+		}
+		return []*listenerv3.Listener{listener},
+			[]*routev3.RouteConfiguration{{Name: "route-config", VirtualHosts: []*routev3.VirtualHost{vh}}}
+	}
+
+	// Ordered by namespace then name, which is the identity the filters are sorted on.
+	want := []string{
+		httpFilterNameForInferencePool(&gwaiev1.InferencePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-alpha", Namespace: "other-ns"},
+		}),
+		httpFilterNameForInferencePool(&gwaiev1.InferencePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-mike", Namespace: "test-ns"},
+		}),
+		httpFilterNameForInferencePool(&gwaiev1.InferencePool{
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-zulu", Namespace: "test-ns"},
+		}),
+		"envoy.filters.http.router",
+	}
+
+	s, err := New(newFakeClient(), logr.Discard(), udsPath, false, nil, nil,
+		"envoy-ai-gateway-ratelimit.envoy-gateway-system", 5, false)
+	require.NoError(t, err)
+
+	// The pools are gathered from a map, so a single pass can land on the right order by
+	// chance. Repeat to catch the randomized iteration order.
+	for i := range 30 {
+		listeners, routes := newFixture()
+		require.NoError(t, s.maybeModifyListenerAndRoutes(listeners, routes))
+
+		var hcm httpconnectionmanagerv3.HttpConnectionManager
+		require.NoError(t, listeners[0].DefaultFilterChain.Filters[0].GetTypedConfig().UnmarshalTo(&hcm))
+		got := make([]string, 0, len(hcm.HttpFilters))
+		for _, f := range hcm.HttpFilters {
+			got = append(got, f.Name)
+		}
+		require.Equal(t, want, got, "filter order differs on pass %d", i)
+	}
 }

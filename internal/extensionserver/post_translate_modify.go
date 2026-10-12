@@ -738,6 +738,20 @@ func (s *Server) maybeModifyListenerAndRoutes(listeners []*listenerv3.Listener, 
 		}
 	}
 
+	// Sorted, because the pools are collected by ranging a map above, which emits them in a
+	// different order every time. That changes the serialized listener, which bumps the xDS
+	// version and makes Envoy replace and drain this listener's filter chain on every
+	// translation, even when no InferencePool changed. Requests that outlive the drain
+	// window are ended when it closes.
+	for _, pools := range listenerToInferencePools {
+		slices.SortFunc(pools, func(a, b *gwaiev1.InferencePool) int {
+			if c := strings.Compare(a.Namespace, b.Namespace); c != 0 {
+				return c
+			}
+			return strings.Compare(a.Name, b.Name)
+		})
+	}
+
 	// patch the listeners, the route configs and the virtual hosts with inference pool filters.
 	for listener, pools := range listenerToInferencePools {
 		s.log.Info("patching listener with inference pool filters", "listener", listener)
